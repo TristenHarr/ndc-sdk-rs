@@ -1,7 +1,8 @@
 use std::process::ExitCode;
 
 use ndc_sdk::connector::example::Example;
-use ndc_sdk::default_main::default_main;
+// use ndc_sdk::default_main::default_main;
+use ndc_sdk::grpc_main::default_main;
 
 /// Run the [`Example`] connector using the [`default_main`]
 /// function, which accepts standard configuration options

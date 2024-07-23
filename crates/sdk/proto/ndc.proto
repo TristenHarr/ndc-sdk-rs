@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package ndc;
+
+service NdcService {
+  rpc GetHealth (HealthRequest) returns (HealthResponse);
+  rpc Query (QueryRequest) returns (QueryResponse);
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  bool healthy = 1;
+}
+
+message QueryRequest {
+  string collection = 1;
+  string query = 2;
+  string arguments = 3;
+  string collection_relationships = 4;
+  string variables = 5;
+}
+
+message QueryResponse {
+  string row_sets = 1;
+}

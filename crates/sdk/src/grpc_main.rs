@@ -222,6 +222,76 @@ where
     }
 }
 
+use tonic::transport::Server as TonicServer;
+use std::net::SocketAddr;
+use tokio::sync::oneshot;
+
+use ndc::ndc_service_server::NdcServiceServer;
+
+pub mod ndc {
+    tonic::include_proto!("ndc");
+}
+
+// async fn serve<Setup>(
+//     setup: Setup,
+//     serve_command: ServeCommand,
+// ) -> Result<(), Box<dyn Error + Send + Sync>>
+// where
+//     Setup: ConnectorSetup,
+//     Setup::Connector: Connector + 'static,
+//     <Setup::Connector as Connector>::Configuration: Clone,
+//     <Setup::Connector as Connector>::State: Clone,
+// {
+//     init_tracing(
+//         serve_command.service_name.as_deref(),
+//         serve_command.otlp_endpoint.as_deref(),
+//     )
+//     .expect("Unable to initialize tracing");
+
+//     let server_state = init_server_state(setup, serve_command.configuration).await?;
+
+//     let router = create_router::<Setup::Connector>(
+//         server_state.clone(),
+//         serve_command.service_token_secret.clone(),
+//     );
+
+//     let address = net::SocketAddr::new(serve_command.host, serve_command.port);
+//     println!("Starting server on {address}!");
+//     axum::Server::bind(&address)
+//         .serve(router.into_make_service())
+//         .with_graceful_shutdown(async {
+//             // wait for a SIGINT, i.e. a Ctrl+C from the keyboard
+//             let sigint = async {
+//                 tokio::signal::ctrl_c()
+//                     .await
+//                     .expect("unable to install signal handler");
+//             };
+//             // wait for a SIGTERM, i.e. a normal `kill` command
+//             #[cfg(unix)]
+//             let sigterm = async {
+//                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+//                     .expect("failed to install signal handler")
+//                     .recv()
+//                     .await
+//             };
+//             // block until either of the above happens
+//             #[cfg(unix)]
+//             tokio::select! {
+//                 () = sigint => (),
+//                 _ = sigterm => (),
+//             }
+//             #[cfg(windows)]
+//             tokio::select! {
+//                 _ = sigint => (),
+//             }
+
+//             opentelemetry::global::shutdown_tracer_provider();
+//         })
+//         .await?;
+
+//     Ok(())
+// }
+
 async fn serve<Setup>(
     setup: Setup,
     serve_command: ServeCommand,
@@ -240,47 +310,118 @@ where
 
     let server_state = init_server_state(setup, serve_command.configuration).await?;
 
-    let router = create_router::<Setup::Connector>(
-        server_state.clone(),
+    // Create a gRPC service
+    let ndc_service = NdcServiceImpl { state: server_state.clone() };
+
+    let grpc_address = SocketAddr::new(serve_command.host, serve_command.port + 1);
+    println!("Starting gRPC server on {grpc_address}!");
+
+    // Create HTTP router without the query route
+    let http_router = create_router::<Setup::Connector>(
+        server_state,
         serve_command.service_token_secret.clone(),
     );
 
-    let address = net::SocketAddr::new(serve_command.host, serve_command.port);
-    println!("Starting server on {address}!");
-    axum::Server::bind(&address)
-        .serve(router.into_make_service())
-        .with_graceful_shutdown(async {
-            // wait for a SIGINT, i.e. a Ctrl+C from the keyboard
-            let sigint = async {
-                tokio::signal::ctrl_c()
-                    .await
-                    .expect("unable to install signal handler");
-            };
-            // wait for a SIGTERM, i.e. a normal `kill` command
-            #[cfg(unix)]
-            let sigterm = async {
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                    .expect("failed to install signal handler")
-                    .recv()
-                    .await
-            };
-            // block until either of the above happens
-            #[cfg(unix)]
-            tokio::select! {
-                () = sigint => (),
-                _ = sigterm => (),
-            }
-            #[cfg(windows)]
-            tokio::select! {
-                _ = sigint => (),
-            }
+    let http_address = SocketAddr::new(serve_command.host, serve_command.port);
+    println!("Starting HTTP server on {http_address}!");
 
-            opentelemetry::global::shutdown_tracer_provider();
-        })
-        .await?;
+    // Channels for graceful shutdown
+    let (grpc_tx, grpc_rx) = oneshot::channel::<()>();
+    let (http_tx, http_rx) = oneshot::channel::<()>();
+
+    // Spawn gRPC server
+    let grpc_server = tokio::spawn(
+        TonicServer::builder()
+            .add_service(NdcServiceServer::new(ndc_service))
+            .serve_with_shutdown(grpc_address, async {
+                grpc_rx.await.ok();
+            })
+    );
+
+    // Spawn HTTP server
+    let http_server = tokio::spawn(
+        axum::Server::bind(&http_address)
+            .serve(http_router.into_make_service())
+            .with_graceful_shutdown(async {
+                http_rx.await.ok();
+            })
+    );
+
+    // Wait for Ctrl+C
+    tokio::signal::ctrl_c().await?;
+    println!("Received Ctrl+C, shutting down...");
+
+    // Send shutdown signals
+    let _ = grpc_tx.send(());
+    let _ = http_tx.send(());
+
+    // Wait for both servers to shut down
+    let _ = tokio::join!(grpc_server, http_server);
 
     Ok(())
 }
+
+struct NdcServiceImpl<C: Connector> {
+    state: ServerState<C>,
+}
+
+impl<C: Connector> std::fmt::Debug for NdcServiceImpl<C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NdcServiceImpl")
+            .field("state", &"<ServerState>")
+            .finish()
+    }
+}
+
+#[tonic::async_trait]
+impl<C: Connector + 'static> ndc::ndc_service_server::NdcService for NdcServiceImpl<C>
+where
+    C::Configuration: Clone + Send + Sync,
+    C::State: Clone + Send + Sync,
+{
+    async fn get_health(
+        &self,
+        _request: tonic::Request<ndc::HealthRequest>,
+    ) -> Result<tonic::Response<ndc::HealthResponse>, tonic::Status> {
+        match C::health_check(&self.state.configuration, &self.state.state).await {
+            Ok(()) => Ok(tonic::Response::new(ndc::HealthResponse { healthy: true })),
+            Err(_) => Ok(tonic::Response::new(ndc::HealthResponse { healthy: false })),
+        }
+    }
+
+    async fn query(
+        &self,
+        request: tonic::Request<ndc::QueryRequest>,
+    ) -> Result<tonic::Response<ndc::QueryResponse>, tonic::Status> {
+        let query_request = request.into_inner();
+        
+        // Parse the QueryRequest from the gRPC message
+        let ndc_query_request: ndc_models::QueryRequest = serde_json::from_str(&query_request.query)
+            .map_err(|e| tonic::Status::invalid_argument(format!("Invalid query JSON: {}", e)))?;
+
+        // Execute the query
+        match C::query(&self.state.configuration, &self.state.state, ndc_query_request).await {
+            Ok(json_response) => {
+                let row_sets = match json_response {
+                    JsonResponse::Value(query_response) => {
+                        // Serialize the QueryResponse to a string
+                        serde_json::to_string(&query_response)
+                            .map_err(|e| tonic::Status::internal(format!("Failed to serialize response: {}", e)))?
+                    },
+                    JsonResponse::Serialized(bytes) => {
+                        // Convert Bytes to String, assuming it's valid UTF-8
+                        String::from_utf8(bytes.to_vec())
+                            .map_err(|e| tonic::Status::internal(format!("Invalid UTF-8 in serialized JSON: {}", e)))?
+                    },
+                };
+
+                Ok(tonic::Response::new(ndc::QueryResponse { row_sets }))
+            },
+            Err(e) => Err(tonic::Status::internal(format!("Query failed: {}", e))),
+        }
+    }
+}
+
 
 /// Initialize the server state from the configuration file.
 pub async fn init_server_state<Setup: ConnectorSetup>(
