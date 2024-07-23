@@ -246,7 +246,7 @@ where
     );
 
     let address = net::SocketAddr::new(serve_command.host, serve_command.port);
-    println!("Starting server on {address}");
+    println!("Starting server on {address}!");
     axum::Server::bind(&address)
         .serve(router.into_make_service())
         .with_graceful_shutdown(async {
