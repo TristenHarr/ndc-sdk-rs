@@ -396,6 +396,8 @@ impl<C: Connector> std::fmt::Debug for NdcServiceImpl<C> {
     }
 }
 
+use tracing::Instrument;
+
 #[tonic::async_trait]
 impl<C: Connector + 'static> ndc::ndc_service_server::NdcService for NdcServiceImpl<C>
 where
@@ -425,33 +427,38 @@ where
             otel.kind = "server"
         );
         span.set_parent(parent_cx);
-        
-        let query_request = request.into_inner();
-        
-        // Parse the QueryRequest from the gRPC message
-        let ndc_query_request: ndc_models::QueryRequest = serde_json::from_str(&query_request.query)
-            .map_err(|e| tonic::Status::invalid_argument(format!("Invalid query JSON: {}", e)))?;
 
-        // Execute the query
-        match C::query(&self.state.configuration, &self.state.state, ndc_query_request).await {
-            Ok(json_response) => {
-                let row_sets = match json_response {
-                    JsonResponse::Value(query_response) => {
-                        // Serialize the QueryResponse to a string
-                        serde_json::to_string(&query_response)
-                            .map_err(|e| tonic::Status::internal(format!("Failed to serialize response: {}", e)))?
-                    },
-                    JsonResponse::Serialized(bytes) => {
-                        // Convert Bytes to String, assuming it's valid UTF-8
-                        String::from_utf8(bytes.to_vec())
-                            .map_err(|e| tonic::Status::internal(format!("Invalid UTF-8 in serialized JSON: {}", e)))?
-                    },
-                };
+        // Use `Instrument::instrument` to attach the span to the future
+        async move {
+            let query_request = request.into_inner();
+            
+            // Parse the QueryRequest from the gRPC message
+            let ndc_query_request: ndc_models::QueryRequest = serde_json::from_str(&query_request.query)
+                .map_err(|e| tonic::Status::invalid_argument(format!("Invalid query JSON: {}", e)))?;
 
-                Ok(tonic::Response::new(ndc::QueryResponse { row_sets }))
-            },
-            Err(e) => Err(tonic::Status::internal(format!("Query failed: {}", e))),
+            // Execute the query
+            match C::query(&self.state.configuration, &self.state.state, ndc_query_request).await {
+                Ok(json_response) => {
+                    let row_sets = match json_response {
+                        JsonResponse::Value(query_response) => {
+                            // Serialize the QueryResponse to a string
+                            serde_json::to_string(&query_response)
+                                .map_err(|e| tonic::Status::internal(format!("Failed to serialize response: {}", e)))?
+                        },
+                        JsonResponse::Serialized(bytes) => {
+                            // Convert Bytes to String, assuming it's valid UTF-8
+                            String::from_utf8(bytes.to_vec())
+                                .map_err(|e| tonic::Status::internal(format!("Invalid UTF-8 in serialized JSON: {}", e)))?
+                        },
+                    };
+
+                    Ok(tonic::Response::new(ndc::QueryResponse { row_sets }))
+                },
+                Err(e) => Err(tonic::Status::internal(format!("Query failed: {}", e))),
+            }
         }
+        .instrument(span)
+        .await
     }
 }
 
