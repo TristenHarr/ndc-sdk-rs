@@ -53,6 +53,8 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["a
 url = "2.5.0"
 tonic = "0.8"
 prost = "0.11"
+prost-types = "0.11"
+indexmap = "1.0"
 
 [build-dependencies]
 tonic-build = "0.8"

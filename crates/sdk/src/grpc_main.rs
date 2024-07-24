@@ -414,6 +414,53 @@ where
         }
     }
 
+    // async fn query(
+    //     &self,
+    //     request: tonic::Request<ndc::QueryRequest>,
+    // ) -> Result<tonic::Response<ndc::QueryResponse>, tonic::Status> {
+    //     let parent_cx = global::get_text_map_propagator(|prop| {
+    //         prop.extract(&MetadataMap(request.metadata()))
+    //     });
+
+    //     let span = tracing::info_span!(
+    //         "grpc_query",
+    //         otel.kind = "server"
+    //     );
+    //     span.set_parent(parent_cx);
+
+    //     // Use `Instrument::instrument` to attach the span to the future
+    //     async move {
+    //         let query_request = request.into_inner();
+            
+    //         // Parse the QueryRequest from the gRPC message
+    //         let ndc_query_request: ndc_models::QueryRequest = serde_json::from_str(&query_request.query)
+    //             .map_err(|e| tonic::Status::invalid_argument(format!("Invalid query JSON: {}", e)))?;
+
+    //         // Execute the query
+    //         match C::query(&self.state.configuration, &self.state.state, ndc_query_request).await {
+    //             Ok(json_response) => {
+    //                 let row_sets = match json_response {
+    //                     JsonResponse::Value(query_response) => {
+    //                         // Serialize the QueryResponse to a string
+    //                         serde_json::to_string(&query_response)
+    //                             .map_err(|e| tonic::Status::internal(format!("Failed to serialize response: {}", e)))?
+    //                     },
+    //                     JsonResponse::Serialized(bytes) => {
+    //                         // Convert Bytes to String, assuming it's valid UTF-8
+    //                         String::from_utf8(bytes.to_vec())
+    //                             .map_err(|e| tonic::Status::internal(format!("Invalid UTF-8 in serialized JSON: {}", e)))?
+    //                     },
+    //                 };
+
+    //                 Ok(tonic::Response::new(ndc::QueryResponse { row_sets }))
+    //             },
+    //             Err(e) => Err(tonic::Status::internal(format!("Query failed: {}", e))),
+    //         }
+    //     }
+    //     .instrument(span)
+    //     .await
+    // }
+
     async fn query(
         &self,
         request: tonic::Request<ndc::QueryRequest>,
@@ -421,13 +468,13 @@ where
         let parent_cx = global::get_text_map_propagator(|prop| {
             prop.extract(&MetadataMap(request.metadata()))
         });
-
+    
         let span = tracing::info_span!(
             "grpc_query",
             otel.kind = "server"
         );
         span.set_parent(parent_cx);
-
+    
         // Use `Instrument::instrument` to attach the span to the future
         async move {
             let query_request = request.into_inner();
@@ -435,11 +482,11 @@ where
             // Parse the QueryRequest from the gRPC message
             let ndc_query_request: ndc_models::QueryRequest = serde_json::from_str(&query_request.query)
                 .map_err(|e| tonic::Status::invalid_argument(format!("Invalid query JSON: {}", e)))?;
-
+    
             // Execute the query
             match C::query(&self.state.configuration, &self.state.state, ndc_query_request).await {
                 Ok(json_response) => {
-                    let row_sets = match json_response {
+                    let row_sets_json = match json_response {
                         JsonResponse::Value(query_response) => {
                             // Serialize the QueryResponse to a string
                             serde_json::to_string(&query_response)
@@ -451,7 +498,30 @@ where
                                 .map_err(|e| tonic::Status::internal(format!("Invalid UTF-8 in serialized JSON: {}", e)))?
                         },
                     };
-
+    
+                    // Parse the JSON string into the new RowSet structure
+                    let row_sets: Vec<ndc::RowSet> = serde_json::from_str::<ndc_models::QueryResponse>(&row_sets_json)
+                        .map_err(|e| tonic::Status::internal(format!("Failed to parse row sets: {}", e)))?
+                        .0
+                        .into_iter()
+                        .map(|rs| ndc::RowSet {
+                            aggregates: rs.aggregates.map(|agg| {
+                                agg.into_iter()
+                                    .map(|(k, v)| (k.to_string(), json_value_to_prost_value(v)))
+                                    .collect()
+                            }).unwrap_or_default(),
+                            rows: rs.rows.map(|rows| {
+                                rows.into_iter()
+                                    .map(|row| ndc::Row {
+                                        fields: row.into_iter()
+                                            .map(|(k, v)| (k.to_string(), json_value_to_prost_value(v.0)))
+                                            .collect(),
+                                    })
+                                    .collect()
+                            }).unwrap_or_default(),
+                        })
+                        .collect();
+    
                     Ok(tonic::Response::new(ndc::QueryResponse { row_sets }))
                 },
                 Err(e) => Err(tonic::Status::internal(format!("Query failed: {}", e))),
@@ -460,7 +530,43 @@ where
         .instrument(span)
         .await
     }
+    
 }
+
+fn json_value_to_prost_value(value: serde_json::Value) -> prost_types::Value {
+    match value {
+        serde_json::Value::Null => prost_types::Value {
+            kind: Some(prost_types::value::Kind::NullValue(0)),
+        },
+        serde_json::Value::Bool(b) => prost_types::Value {
+            kind: Some(prost_types::value::Kind::BoolValue(b)),
+        },
+        serde_json::Value::Number(n) => prost_types::Value {
+            kind: Some(prost_types::value::Kind::NumberValue(n.as_f64().unwrap_or(0.0))),
+        },
+        serde_json::Value::String(s) => prost_types::Value {
+            kind: Some(prost_types::value::Kind::StringValue(s)),
+        },
+        serde_json::Value::Array(arr) => {
+            let values = arr.into_iter()
+                .map(json_value_to_prost_value)
+                .collect();
+            prost_types::Value {
+                kind: Some(prost_types::value::Kind::ListValue(prost_types::ListValue { values })),
+            }
+        },
+        serde_json::Value::Object(obj) => {
+            let fields = obj.into_iter()
+                .map(|(k, v)| (k, json_value_to_prost_value(v)))
+                .collect();
+            prost_types::Value {
+                kind: Some(prost_types::value::Kind::StructValue(prost_types::Struct { fields })),
+            }
+        },
+    }
+}
+
+
 
 
 /// Initialize the server state from the configuration file.
