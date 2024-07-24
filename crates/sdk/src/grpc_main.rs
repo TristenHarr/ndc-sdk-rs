@@ -292,6 +292,29 @@ pub mod ndc {
 //     Ok(())
 // }
 
+use opentelemetry::global;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
+use opentelemetry::propagation::Extractor;
+
+struct MetadataMap<'a>(&'a tonic::metadata::MetadataMap);
+
+impl<'a> Extractor for MetadataMap<'a> {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).and_then(|metadata| metadata.to_str().ok())
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        self.0
+            .keys()
+            .filter_map(|key| match key {
+                tonic::metadata::KeyRef::Ascii(k) => Some(k.as_str()),
+                tonic::metadata::KeyRef::Binary(_) => None, // Skip binary keys
+            })
+            .collect()
+    }
+}
+
+
 async fn serve<Setup>(
     setup: Setup,
     serve_command: ServeCommand,
@@ -393,6 +416,16 @@ where
         &self,
         request: tonic::Request<ndc::QueryRequest>,
     ) -> Result<tonic::Response<ndc::QueryResponse>, tonic::Status> {
+        let parent_cx = global::get_text_map_propagator(|prop| {
+            prop.extract(&MetadataMap(request.metadata()))
+        });
+
+        let span = tracing::info_span!(
+            "grpc_query",
+            otel.kind = "server"
+        );
+        span.set_parent(parent_cx);
+        
         let query_request = request.into_inner();
         
         // Parse the QueryRequest from the gRPC message
