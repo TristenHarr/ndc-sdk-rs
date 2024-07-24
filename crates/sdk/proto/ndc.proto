@@ -2,8 +2,6 @@ syntax = "proto3";
 
 package ndc;
 
-import "google/protobuf/struct.proto";
-
 service NdcService {
   rpc GetHealth (HealthRequest) returns (HealthResponse);
   rpc Query (QueryRequest) returns (QueryResponse);
@@ -24,14 +22,5 @@ message QueryRequest {
 }
 
 message QueryResponse {
-  repeated RowSet row_sets = 1;
-}
-
-message RowSet {
-  map<string, google.protobuf.Value> aggregates = 1;
-  repeated Row rows = 2;
-}
-
-message Row {
-  map<string, google.protobuf.Value> fields = 1;
+  string row_sets = 1;
 }
